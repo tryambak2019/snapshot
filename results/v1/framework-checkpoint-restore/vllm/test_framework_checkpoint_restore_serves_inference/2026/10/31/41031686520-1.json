@@ -1,0 +1,39 @@
+{
+  "benchmarkVersion": 1,
+  "environment": {
+    "collectionError": "matrix job produced no valid benchmark artifact"
+  },
+  "error": {
+    "message": "no benchmark artifact was uploaded",
+    "phase": "artifact_collection"
+  },
+  "events": [],
+  "finishedAt": "2026-10-31T09:15:02.975Z",
+  "identity": {
+    "case": "vllm",
+    "runAttempt": 1,
+    "runId": "41031686520",
+    "suite": "framework-checkpoint-restore",
+    "test": "test_framework_checkpoint_restore_serves_inference"
+  },
+  "measurements": [
+    {
+      "displayName": "Full E2E test",
+      "missingReason": "test result artifact unavailable",
+      "name": "test.total.duration",
+      "status": "incomplete",
+      "unit": "seconds",
+      "value": null
+    }
+  ],
+  "outcome": "infrastructure_failed",
+  "schemaVersion": 1,
+  "source": {
+    "commit": "900c86235e63dbf62197c31849452a90893189ff",
+    "event": "schedule",
+    "ref": "refs/heads/main",
+    "runUrl": "https://github.com/tryambak2019/snapshot/actions/runs/41031686520",
+    "snapshotTag": null
+  },
+  "startedAt": "2026-10-31T09:15:02.975Z"
+}
