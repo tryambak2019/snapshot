@@ -143,7 +143,8 @@ const nonTargetJobListPageLimit int64 = 500
 const nonTargetJobPagesPerSweep = 4
 const nonTargetScanContinuationDelay = 100 * time.Millisecond
 const nonTargetScanRetryDelay = 5 * time.Second
-const noPodWriterProofReason = "source Pod record is absent; writer exit cannot be proven across Kubernetes versions"
+const missingPodTerminalProofReason = "source Job terminal conditions do not prove all source Pod attempts stopped"
+const missingPodPolicyProofReason = "source Job policy or controller cannot prove source Pod termination"
 const sourcePodIdentityReason = "original source Pod identity or termination is not proven"
 const missingSourceJobUIDReason = "no source Job UID was recorded"
 const absentSourceJobReason = "source Job is absent; disappearance is not writer-exit proof"
@@ -153,7 +154,7 @@ const writerEnvironmentMismatchReason = "declared writer lacks the exact attempt
 
 func permanentNonTargetRetention(reason string) bool {
 	switch reason {
-	case noPodWriterProofReason, sourcePodIdentityReason, missingSourceJobUIDReason, absentSourceJobReason, sourceJobIdentityMismatchReason,
+	case missingPodTerminalProofReason, missingPodPolicyProofReason, sourcePodIdentityReason, missingSourceJobUIDReason, absentSourceJobReason, sourceJobIdentityMismatchReason,
 		writerDeclarationMismatchReason, writerEnvironmentMismatchReason:
 		return true
 	default:
@@ -284,11 +285,7 @@ func (q *Queue) nonTargetArtifactWritersStopped(ctx context.Context, sj *snapsho
 		return false, "", fmt.Errorf("list source Pods for non-target cleanup: %w", err)
 	}
 	if len(pods.Items) == 0 {
-		// A terminal Job condition proves writer termination on Kubernetes
-		// 1.31+, but earlier supported clusters can publish it while Pods are
-		// still terminating. With no Pod record, this operator cannot prove
-		// quiescence across versions. Retain the root for verified manual cleanup.
-		return false, noPodWriterProofReason, nil
+		return missingPodJobProvesWritersStopped(job)
 	}
 	if job.Status.Active != 0 || (job.Status.Terminating != nil && *job.Status.Terminating != 0) ||
 		(job.Status.UncountedTerminatedPods != nil &&
@@ -299,7 +296,7 @@ func (q *Queue) nonTargetArtifactWritersStopped(ctx context.Context, sj *snapsho
 	// clusters. Do not let a surviving replacement stand in for the original.
 	counted := job.Status.Failed + job.Status.Succeeded
 	if counted > int32(len(pods.Items)) {
-		return false, noPodWriterProofReason, nil
+		return false, missingPodTerminalProofReason, nil
 	}
 	if counted < int32(len(pods.Items)) {
 		return false, "source Job has not counted all Pod attempts", nil
@@ -327,6 +324,49 @@ func (q *Queue) nonTargetArtifactWritersStopped(ctx context.Context, sj *snapsho
 		}
 	}
 	return true, "", nil
+}
+
+// missingPodJobProvesWritersStopped accepts only the terminal-condition path
+// introduced by the built-in Job controller in Kubernetes 1.31. On that path,
+// FailureTarget or SuccessCriteriaMet starts termination, and Failed or Complete
+// is added only after every Pod has terminated. Requiring both conditions makes
+// the proof independent of server-version discovery and fail closed if the
+// feature gates that select the delayed terminal path are disabled.
+func missingPodJobProvesWritersStopped(job *batchv1.Job) (bool, string, error) {
+	if !supportedMissingPodJobPolicy(job) {
+		return false, missingPodPolicyProofReason, nil
+	}
+	failureProven := jobConditionTrue(job, batchv1.JobFailureTarget) && jobConditionTrue(job, batchv1.JobFailed)
+	successProven := jobConditionTrue(job, batchv1.JobSuccessCriteriaMet) && jobConditionTrue(job, batchv1.JobComplete)
+	if !failureProven && !successProven {
+		return false, missingPodTerminalProofReason, nil
+	}
+	if job.Status.Active != 0 || (job.Status.Terminating != nil && *job.Status.Terminating != 0) ||
+		(job.Status.UncountedTerminatedPods != nil &&
+			(len(job.Status.UncountedTerminatedPods.Failed) != 0 || len(job.Status.UncountedTerminatedPods.Succeeded) != 0)) {
+		return false, "source Job still has active, terminating, or uncounted Pod attempts", nil
+	}
+	return true, "", nil
+}
+
+func supportedMissingPodJobPolicy(job *batchv1.Job) bool {
+	if job.Spec.PodFailurePolicy != nil || job.Spec.PodReplacementPolicy != nil || job.Spec.SuccessPolicy != nil ||
+		job.Spec.BackoffLimitPerIndex != nil || job.Spec.MaxFailedIndexes != nil {
+		return false
+	}
+	if job.Spec.CompletionMode != nil && *job.Spec.CompletionMode != batchv1.NonIndexedCompletion {
+		return false
+	}
+	return job.Spec.ManagedBy == nil || *job.Spec.ManagedBy == "kubernetes.io/job-controller"
+}
+
+func jobConditionTrue(job *batchv1.Job, conditionType batchv1.JobConditionType) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == conditionType && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func allPodContainersStopped(pod *corev1.Pod) bool {

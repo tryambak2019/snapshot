@@ -77,6 +77,11 @@ commit-level history for each release is on its
 
 ### Changed
 
+- Failed `SnapshotJob` non-target artifact cleanup can use the built-in source
+  Job's paired termination and terminal conditions to prove all containers
+  stopped after the source Pod record is gone. Ambiguous or modified Jobs
+  remain retained and emit `NonTargetArtifactsRetained`.
+
 - **Breaking:** the agent timeout values lost their redundant prefixes.
   `config.checkpoint.checkpointTimeoutSeconds` is now
   `config.checkpoint.timeoutSeconds`, and `config.restore.restoreTimeoutSeconds`

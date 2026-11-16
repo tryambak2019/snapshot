@@ -742,114 +742,200 @@ def test_snapshotjob_deadline_exceeded_when_helper_overruns(
 
 @pytest.mark.cpu
 @pytest.mark.snapshot_failure
-def test_snapshotjob_deadline_removed_pod_retains_non_target_artifacts(
+def test_snapshotjob_deadline_removed_pod_reclaims_non_target_artifacts(
     config: k8s.E2EConfig,
     run: snap.TestRun,
 ) -> None:
-    # A Job deadline can remove its source Pod before maintenance observes
-    # terminal container statuses. The opt-in policy must fail closed in that
-    # case, even if the Job itself reports Failed.
+    # FailureTarget starts Pod termination before Failed is published. Keep the
+    # non-target container alive in preStop long enough to observe a maintenance
+    # sweep, then remove its stopped Pod record. The paired terminal conditions
+    # must let a later sweep reclaim only this attempt's non-target artifacts.
     try:
         name = run.snapshotjob_name
+        store_mount = "/snapshot-store"
+        template = workloads.snapshotjob_helper_pod_template(
+            config=config,
+            run=run,
+            helper_command=f"""set -euo pipefail
+root={store_mount}/${{SNAPSHOT_NON_TARGET_ARTIFACT_SUBDIR:?}}
+mkdir -p "$root"
+printf writer-proof > "$root/writer-e2e-marker"
+sleep infinity
+""",
+        )
+        template["spec"]["terminationGracePeriodSeconds"] = 60
+        template["spec"]["volumes"].append(
+            {
+                "name": "snapshot-store",
+                "persistentVolumeClaim": {"claimName": config.pvc_name},
+            }
+        )
+        helper = template["spec"]["containers"][-1]
+        helper["volumeMounts"].append(
+            {"name": "snapshot-store", "mountPath": store_mount}
+        )
+        helper["lifecycle"] = {
+            "preStop": {
+                "exec": {
+                    "command": [
+                        "/bin/bash",
+                        "-lc",
+                        "sleep 30",
+                    ]
+                }
+            }
+        }
         created = snap.create_snapshotjob(
             config.namespace,
             name,
-            workloads.snapshotjob_helper_pod_template(
-                config=config,
-                run=run,
-                helper_command="sleep infinity",
-            ),
+            template,
             active_deadline_seconds=60,
             non_target_artifacts={"containers": ["helper"], "onFailure": "Cleanup"},
         )
         uid = created["metadata"]["uid"]
         source = snap.wait_for_job_source_pod(config.namespace, name)
         source_name = source.metadata.name
+
         def source_node() -> str | None:
             return k8s.read_pod(config.namespace, source_name).spec.node_name
 
         node = snap.wait_for("source Pod node assignment", source_node, 120)
+        agent = snap.checkpoint_agent_pod(config, node)
+        root = f"{snap.AGENT_CHECKPOINT_DIR}/non-target-artifacts/{uid}"
+        marker = f"{root}/writer-e2e-marker"
+        canary_root = f"{snap.AGENT_CHECKPOINT_DIR}/non-target-artifacts/{uid}-canary"
+
+        def marker_exists() -> bool | None:
+            output = k8s.exec_command(
+                config.namespace,
+                agent,
+                f"test -f {shlex.quote(marker)} && printf present",
+                container=snap.AGENT_CONTAINER,
+            )
+            return True if output == "present" else None
+
+        snap.wait_for("non-target container artifact", marker_exists, 120)
+        k8s.exec_command(
+            config.namespace,
+            agent,
+            f"mkdir -p {shlex.quote(canary_root)} && "
+            f"printf canary > {shlex.quote(canary_root)}/proof",
+            container=snap.AGENT_CONTAINER,
+        )
         failed_job = snap.wait_for_condition(
             config.namespace, name, plural=snap.SNAPSHOTJOBS,
             condition_type="Failed", timeout=300,
         )
         assert snap.condition(failed_job, "Failed")["reason"] == "DeadlineExceeded"
+        assert snap.condition(failed_job, "Captured")["status"] == "True"
 
-        def source_job_failed() -> bool | None:
-            job = k8s.read_job(config.namespace, name)
-            if job and job.status and any(
-                c.type == "Failed" and c.status == "True"
-                for c in job.status.conditions or []
+        def retention_sweep() -> bool | None:
+            for operator in k8s.list_snapshot_pods(
+                config.namespace, config.release, "operator"
             ):
-                return True
+                logs = k8s.pod_logs(
+                    config.namespace,
+                    operator.metadata.name,
+                    tail_lines=2000,
+                    container="manager",
+                )
+                if uid in logs and "writer termination is proven" in logs:
+                    return True
             return None
 
-        snap.wait_for("terminal source Job", source_job_failed, 120)
+        snap.wait_for("maintenance sweep during source Pod termination", retention_sweep, 120)
+        assert marker_exists(), "maintenance must retain bytes while the writer may be running"
 
-        # If the Job controller retained a terminal Pod, remove only that
-        # stopped record to exercise the same no-Pod proof boundary.
-        def stopped_or_gone() -> bool | None:
+        def source_stopped() -> bool | None:
             try:
                 pod = k8s.read_pod(config.namespace, source_name)
             except ApiException as exc:
                 if exc.status == 404:
-                    return True
+                    pytest.fail("source Pod disappeared before its stopped state was observed")
                 raise
             if pod.status.phase not in {"Failed", "Succeeded"}:
                 return None
             statuses = {s.name: s for s in pod.status.container_statuses or []}
-            if all(statuses.get(c.name) and statuses[c.name].state.terminated for c in pod.spec.containers):
+            if all(
+                statuses.get(container.name)
+                and statuses[container.name].state.terminated
+                for container in pod.spec.containers
+            ):
                 return True
             return None
 
-        snap.wait_for("source Pod termination or removal", stopped_or_gone, 120)
-        try:
-            k8s.read_pod(config.namespace, source_name)
-        except ApiException as exc:
-            if exc.status != 404:
-                raise
-        else:
-            client.CoreV1Api().delete_namespaced_pod(source_name, config.namespace)
-            snap.wait_for_pod_deleted(config.namespace, source_name)
+        snap.wait_for("source Pod container termination", source_stopped, 120)
+        client.CoreV1Api().delete_namespaced_pod(source_name, config.namespace)
+        snap.wait_for_pod_deleted(config.namespace, source_name)
+        assert marker_exists(), (
+            "the non-target artifact must still exist after the Pod record is removed"
+        )
 
-        agent = snap.checkpoint_agent_pod(config, node)
-        root = f"{snap.AGENT_CHECKPOINT_DIR}/non-target-artifacts/{uid}"
-        marker = f"{root}/retained-e2e-marker"
-        # Model bytes left by a helper after Pod GC. Create them after the Pod
-        # is gone so the sweep cannot remove the root in the earlier safe phase.
-        try:
-            k8s.exec_command(
-                config.namespace, agent,
-                f"mkdir -p {shlex.quote(root)} && printf proof > {shlex.quote(marker)}",
-                container=snap.AGENT_CONTAINER,
-            )
-
-            def retention_warning() -> bool | None:
-                if any(
-                    event.reason == "NonTargetArtifactsRetained" and event.involved_object.uid == uid
-                    for event in k8s.list_events(config.namespace)
-                ):
-                    return True
+        def source_job_proves_termination() -> bool | None:
+            job = k8s.read_job(config.namespace, name)
+            if not job or not job.status:
                 return None
+            conditions = {
+                condition.type
+                for condition in job.status.conditions or []
+                if condition.status == "True"
+            }
+            paired = {"FailureTarget", "Failed"}.issubset(conditions) or {
+                "SuccessCriteriaMet",
+                "Complete",
+            }.issubset(conditions)
+            uncounted = job.status.uncounted_terminated_pods
+            if not paired or job.status.active:
+                return None
+            if job.status.terminating:
+                return None
+            if uncounted and (uncounted.failed or uncounted.succeeded):
+                return None
+            return True
 
-            snap.wait_for("non-target artifact retention warning", retention_warning, 120)
-            # The warning can precede the marker. Let at least one more scan
-            # pass to prove the no-Pod policy preserves the bytes afterward.
-            time.sleep(12)
+        snap.wait_for("terminal source Job evidence", source_job_proves_termination, 120)
+
+        content_uid = snap.bound_content_uid(config, failed_job["status"]["podSnapshotName"])
+        assert content_uid, "captured SnapshotJob must retain its PodSnapshotContent"
+
+        def attempt_reclaimed() -> bool | None:
             output = k8s.exec_command(
-                config.namespace, agent,
-                f"test -f {shlex.quote(marker)} && printf retained",
+                config.namespace,
+                agent,
+                f"test ! -e {shlex.quote(root)} && printf reclaimed",
                 container=snap.AGENT_CONTAINER,
             )
-            assert output == "retained", "the failed attempt's root must remain after Pod removal"
+            return True if output == "reclaimed" else None
+
+        try:
+            snap.wait_for("non-target attempt reclamation", attempt_reclaimed, 120)
+            canary = k8s.exec_command(
+                config.namespace,
+                agent,
+                f"test -f {shlex.quote(canary_root)}/proof && printf retained",
+                container=snap.AGENT_CONTAINER,
+            )
+            assert canary == "retained", "cleanup must not remove another attempt's root"
+            assert snap.artifact_root_exists(config, node, content_uid), (
+                "non-target cleanup must not remove captured artifacts"
+            )
         finally:
-            # This test owns the synthetic root; never leave it on the shared PVC.
+            # The operator normally removes root. Clean exact test-owned paths
+            # after a failed assertion so the shared PVC stays reusable.
             k8s.exec_command(
-                config.namespace, agent,
-                f"rm -rf -- {shlex.quote(root)}",
+                config.namespace,
+                agent,
+                f"rm -rf -- {shlex.quote(root)} {shlex.quote(canary_root)}",
                 container=snap.AGENT_CONTAINER,
             )
     except Exception:
+        if all(key in locals() for key in ("agent", "root", "canary_root")):
+            k8s.exec_command(
+                config.namespace,
+                agent,
+                f"rm -rf -- {shlex.quote(root)} {shlex.quote(canary_root)}",
+                container=snap.AGENT_CONTAINER,
+            )
         snap.debug_dump_snapshotjob(config, run)
         raise
 

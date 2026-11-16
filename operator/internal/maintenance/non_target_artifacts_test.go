@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ai-dynamo/snapshot/api/podcontract"
 	snapshotv1alpha1 "github.com/ai-dynamo/snapshot/api/v1alpha1"
@@ -210,30 +211,123 @@ func TestNonTargetArtifactSweepFailureOrdering(t *testing.T) {
 
 func TestNonTargetArtifactSweepAfterDeadlinePodRemoval(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		condition batchv1.JobConditionType
+		name        string
+		mutate      func(*batchv1.Job)
+		wantDeleted bool
+		wantWarning bool
 	}{
-		{name: "terminal failure without pod proof", condition: batchv1.JobFailed},
-		{name: "failure target before pod termination", condition: batchv1.JobFailureTarget},
+		{name: "failed without failure target", mutate: func(*batchv1.Job) {}, wantWarning: true},
+		{name: "failure target before pod termination", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue}}
+		}},
+		{name: "false failure target", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionFalse})
+		}, wantWarning: true},
+		{name: "failure condition pair", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue})
+		}, wantDeleted: true},
+		{name: "failure pair with explicit built-in controller", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue})
+			job.Spec.ManagedBy = ptr.To("kubernetes.io/job-controller")
+			job.Spec.CompletionMode = ptr.To(batchv1.NonIndexedCompletion)
+		}, wantDeleted: true},
+		{name: "success condition pair", mutate: func(job *batchv1.Job) {
+			job.Status.Failed = 0
+			job.Status.Succeeded = 1
+			job.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue},
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+		}, wantDeleted: true},
+		{name: "active attempt", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue})
+			job.Status.Active = 1
+		}},
+		{name: "terminating attempt", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue})
+			job.Status.Terminating = ptr.To(int32(1))
+		}},
+		{name: "uncounted attempt", mutate: func(job *batchv1.Job) {
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue})
+			job.Status.UncountedTerminatedPods = &batchv1.UncountedTerminatedPods{Failed: []types.UID{"pod-uid"}}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sj, job, _ := failedNonTargetAttempt()
-			job.Status.Conditions[0].Type = tc.condition
+			tc.mutate(job)
 			base := t.TempDir()
 			root := writeNonTargetArtifact(t, base, string(sj.UID))
 			q, recorder := newTestQueue(t, base, sj, job) // Job controller removed its Pod.
 			backend, err := q.backend()
 			require.NoError(t, err)
 			require.NoError(t, q.processNonTargetArtifactSweep(context.Background(), backend, log.Log))
-			require.DirExists(t, root, "without an authoritative Pod record the writer may still be stopping")
+			if tc.wantDeleted {
+				require.NoDirExists(t, root)
+			} else {
+				require.DirExists(t, root, "cleanup requires complete terminal Job evidence")
+			}
 			require.NoError(t, q.processNonTargetArtifactSweep(context.Background(), backend, log.Log))
-			if tc.condition == batchv1.JobFailed {
+			if tc.wantDeleted || tc.wantWarning {
 				select {
 				case event := <-recorder.Events:
-					require.Contains(t, event, "NonTargetArtifactsRetained")
+					if tc.wantDeleted {
+						require.Contains(t, event, "NonTargetArtifactsReclaimed")
+					} else {
+						require.Contains(t, event, "NonTargetArtifactsRetained")
+					}
 				default:
-					t.Fatal("expected retention warning")
+					t.Fatal("expected non-target artifact event")
 				}
+			}
+			select {
+			case event := <-recorder.Events:
+				t.Fatalf("unexpected repeated retention event: %s", event)
+			default:
+			}
+		})
+	}
+}
+
+func TestNonTargetArtifactSweepAfterPodRemovalRequiresSupportedJobPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*batchv1.Job)
+	}{
+		{"pod failure policy", func(job *batchv1.Job) { job.Spec.PodFailurePolicy = &batchv1.PodFailurePolicy{} }},
+		{"pod replacement policy", func(job *batchv1.Job) {
+			job.Spec.PodReplacementPolicy = ptr.To(batchv1.PodReplacementPolicy("Failed"))
+		}},
+		{"success policy", func(job *batchv1.Job) { job.Spec.SuccessPolicy = &batchv1.SuccessPolicy{} }},
+		{"backoff per index", func(job *batchv1.Job) { job.Spec.BackoffLimitPerIndex = ptr.To(int32(1)) }},
+		{"maximum failed indexes", func(job *batchv1.Job) { job.Spec.MaxFailedIndexes = ptr.To(int32(1)) }},
+		{"indexed completion", func(job *batchv1.Job) { job.Spec.CompletionMode = ptr.To(batchv1.IndexedCompletion) }},
+		{"custom controller", func(job *batchv1.Job) { job.Spec.ManagedBy = ptr.To("example.com/job-controller") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sj, job, _ := failedNonTargetAttempt()
+			job.Status.Conditions = append(job.Status.Conditions,
+				batchv1.JobCondition{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue})
+			tc.mutate(job)
+			base := t.TempDir()
+			root := writeNonTargetArtifact(t, base, string(sj.UID))
+			q, recorder := newTestQueue(t, base, sj, job)
+			backend, err := q.backend()
+			require.NoError(t, err)
+			for range 2 {
+				require.NoError(t, q.processNonTargetArtifactSweep(context.Background(), backend, log.Log))
+			}
+			require.DirExists(t, root)
+			select {
+			case event := <-recorder.Events:
+				require.Contains(t, event, "NonTargetArtifactsRetained")
+			case <-time.After(time.Second):
+				t.Fatal("expected retention warning")
 			}
 			select {
 			case event := <-recorder.Events:
